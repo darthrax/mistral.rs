@@ -1,6 +1,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use mistralrs_quant::{
@@ -558,8 +559,9 @@ impl PleTable {
         })
     }
 
-    /// Host gather of `rows` into a `[rows.len(), head_dim]` tensor on `device`.
-    fn gather_host(&self, rows: &[u64], device: &Device) -> Result<Tensor> {
+    /// Host gather of `rows` into a `[rows.len(), head_dim]` tensor on `device`,
+    /// applying `overlay` values to any overridden rows.
+    fn gather_host(&self, rows: &[u64], overlay: &PleOverlay, device: &Device) -> Result<Tensor> {
         let outside = |row: u64| {
             candle_core::Error::msg(format!("PLE row {row} is outside the n-gram table"))
         };
@@ -571,26 +573,40 @@ impl PleTable {
                 dtype,
             } => {
                 let row_bytes = self.head_dim * dtype.size_in_bytes();
-                let mut data = vec![0u8; rows.len() * row_bytes];
-                for (dst, &row) in data.chunks_exact_mut(row_bytes).zip(rows) {
-                    let idx = row as usize;
-                    let shard = starts.partition_point(|start| *start <= idx) - 1;
-                    let view = raw.get(&names[shard])?;
-                    let offset = (idx - starts[shard]) * row_bytes;
-                    let src = view
-                        .data()
-                        .get(offset..offset + row_bytes)
-                        .ok_or_else(|| outside(row))?;
-                    dst.copy_from_slice(src);
+                if overlay.is_empty() {
+                    let mut data = vec![0u8; rows.len() * row_bytes];
+                    for (dst, &row) in data.chunks_exact_mut(row_bytes).zip(rows) {
+                        copy_shard_row(raw, names, starts, row, row_bytes, dst)?;
+                    }
+                    return Tensor::from_raw_buffer(
+                        &data,
+                        *dtype,
+                        &[rows.len(), self.head_dim],
+                        &Device::Cpu,
+                    )?
+                    .to_device(device);
                 }
-                Tensor::from_raw_buffer(&data, *dtype, &[rows.len(), self.head_dim], &Device::Cpu)?
-                    .to_device(device)
+                let mut out = vec![0f32; rows.len() * self.head_dim];
+                let mut scratch = vec![0u8; row_bytes];
+                for (dst, &row) in out.chunks_exact_mut(self.head_dim).zip(rows) {
+                    if let Some(values) = overlay.get(row) {
+                        dst.copy_from_slice(values);
+                        continue;
+                    }
+                    copy_shard_row(raw, names, starts, row, row_bytes, &mut scratch)?;
+                    decode_shard_row(&scratch, *dtype, dst)?;
+                }
+                Tensor::from_vec(out, (rows.len(), self.head_dim), device)
             }
             TableSource::Gguf { archive, .. } => {
                 let row_bytes = iq4_nl_row_bytes(self.head_dim);
                 let bytes = archive.tensor_data(GGUF_TABLE_NAME)?.bytes();
                 let mut out = vec![0f32; rows.len() * self.head_dim];
                 for (dst, &row) in out.chunks_exact_mut(self.head_dim).zip(rows) {
+                    if let Some(values) = overlay.get(row) {
+                        dst.copy_from_slice(values);
+                        continue;
+                    }
                     let offset = row as usize * row_bytes;
                     let src = bytes
                         .get(offset..offset + row_bytes)
@@ -738,9 +754,105 @@ pub(super) struct PleBatch<'a> {
     pub layout: Option<&'a crate::cuda::qwen4_exp::TokenLayout>,
 }
 
+/// Runtime edits to the hashed n-gram table: global row -> `head_dim` values.
+///
+/// Overrides are applied when rows are gathered on the host. A non-empty overlay
+/// forces the host gather path so a write can never be silently ignored.
+#[derive(Debug, Clone)]
+pub(super) struct PleOverlay {
+    head_dim: usize,
+    rows: BTreeMap<u64, Vec<f32>>,
+}
+
+#[allow(dead_code)] // some accessors are used by tests now and by the public API in phase 2
+impl PleOverlay {
+    pub(super) fn new(head_dim: usize) -> Self {
+        Self {
+            head_dim,
+            rows: BTreeMap::new(),
+        }
+    }
+
+    pub(super) fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    pub(super) fn set(&mut self, row: u64, values: Vec<f32>) -> Result<Option<Vec<f32>>> {
+        if values.len() != self.head_dim {
+            candle_core::bail!(
+                "PLE overlay row must have {} values, got {}",
+                self.head_dim,
+                values.len()
+            );
+        }
+        Ok(self.rows.insert(row, values))
+    }
+
+    pub(super) fn remove(&mut self, row: u64) -> Option<Vec<f32>> {
+        self.rows.remove(&row)
+    }
+
+    pub(super) fn get(&self, row: u64) -> Option<&[f32]> {
+        self.rows.get(&row).map(Vec::as_slice)
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.rows.len()
+    }
+}
+
+/// Copy one raw table row from the memory-mapped shards into `dst`.
+fn copy_shard_row(
+    raw: &MmapedSafetensors,
+    names: &[String],
+    starts: &[usize],
+    row: u64,
+    row_bytes: usize,
+    dst: &mut [u8],
+) -> Result<()> {
+    let idx = row as usize;
+    let shard = starts.partition_point(|start| *start <= idx) - 1;
+    let view = raw.get(&names[shard])?;
+    let offset = (idx - starts[shard]) * row_bytes;
+    let src = view.data().get(offset..offset + row_bytes).ok_or_else(|| {
+        candle_core::Error::msg(format!("PLE row {row} is outside the n-gram table"))
+    })?;
+    dst.copy_from_slice(src);
+    Ok(())
+}
+
+/// Decode a raw shard row into f32 values when an overlay must be applied.
+fn decode_shard_row(src: &[u8], dtype: DType, out: &mut [f32]) -> Result<()> {
+    match dtype {
+        DType::F32 => {
+            for (value, chunk) in out.iter_mut().zip(src.chunks_exact(4)) {
+                *value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+        }
+        DType::F16 => {
+            for (value, chunk) in out.iter_mut().zip(src.chunks_exact(2)) {
+                *value = half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
+            }
+        }
+        DType::BF16 => {
+            for (value, chunk) in out.iter_mut().zip(src.chunks_exact(2)) {
+                *value = half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
+            }
+        }
+        other => candle_core::bail!("PLE shard dtype {other:?} is not supported for overlays"),
+    }
+    Ok(())
+}
+
 /// Hashed n-gram embedding injected into every hyper-connection stream (HF `Qwen4ExpTextPLELayer`).
 pub(super) struct PleLayer {
     table: PleTable,
+    /// Runtime row edits, shared so the public API can update them later.
+    overlay: Arc<RwLock<PleOverlay>>,
     hash: PleHash,
     #[cfg(feature = "cuda")]
     hash_ffi: crate::cuda::qwen4_exp::Q4PleHashParams,
@@ -782,6 +894,7 @@ impl PleLayer {
             #[cfg(feature = "cuda")]
             hash_ffi: hash.ffi()?,
             table,
+            overlay: Arc::new(RwLock::new(PleOverlay::new(ple.head_dim()))),
             hash,
             key_proj: ReplicatedLayer::new(
                 ple.embed_dim,
@@ -810,7 +923,14 @@ impl PleLayer {
 
     #[cfg(feature = "cuda")]
     pub(super) fn gathers_on_device(&self) -> bool {
-        self.table.resident.is_some() || self.table.device_index.is_some()
+        // An active overlay must be applied, and rows can only be replaced on the
+        // host, so force the host path. An empty overlay keeps the device path.
+        let no_overlay = self
+            .overlay
+            .read()
+            .map(|overlay| overlay.is_empty())
+            .unwrap_or(false);
+        no_overlay && (self.table.resident.is_some() || self.table.device_index.is_some())
     }
 
     /// Quantize the n-gram table into device memory if it fits; call once the rest of the model is loaded.
@@ -971,7 +1091,13 @@ impl PleLayer {
             let row = Tensor::from_vec(tail, (1, context), state.history.device())?;
             state.history.slice_set(&row, 0, slots[seq] as usize)?;
         }
-        let emb = self.table.gather_host(&rows, state.conv.device())?;
+        let overlay = self
+            .overlay
+            .read()
+            .map_err(|_| candle_core::Error::msg("PLE overlay lock is poisoned"))?;
+        let emb = self
+            .table
+            .gather_host(&rows, &overlay, state.conv.device())?;
         emb.reshape((n_tokens, heads * self.table.head_dim))
     }
 
@@ -1157,5 +1283,26 @@ mod tests {
         hash.rows(&tokens[5..], 0, &[Some(248044), Some(553)], &mut split);
         hash.rows(&tokens, 5, &[None, None], &mut rows);
         assert_eq!(split, rows);
+    }
+
+    #[test]
+    fn ple_overlay_sets_gets_and_removes_rows() {
+        let mut overlay = PleOverlay::new(3);
+        assert!(overlay.is_empty());
+        assert_eq!(overlay.set(7, vec![1.0, 2.0, 3.0]).unwrap(), None);
+        assert_eq!(overlay.get(7), Some(&[1.0, 2.0, 3.0][..]));
+        assert_eq!(
+            overlay.set(7, vec![4.0, 5.0, 6.0]).unwrap(),
+            Some(vec![1.0, 2.0, 3.0])
+        );
+        assert_eq!(overlay.len(), 1);
+        assert_eq!(overlay.remove(7), Some(vec![4.0, 5.0, 6.0]));
+        assert!(overlay.is_empty());
+    }
+
+    #[test]
+    fn ple_overlay_rejects_a_row_of_the_wrong_width() {
+        let mut overlay = PleOverlay::new(3);
+        assert!(overlay.set(1, vec![1.0, 2.0]).is_err());
     }
 }
