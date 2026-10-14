@@ -1260,4 +1260,53 @@ mod tests {
         let mut overlay = EngramOverlay::new(3);
         assert!(overlay.set(1, vec![1.0, 2.0]).is_err());
     }
+
+    #[test]
+    fn engram_overlay_changes_gathered_rows() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shard.safetensors");
+        Tensor::from_vec(
+            vec![1f32, 2., 3., 4., 5., 6., 7., 8.],
+            (4, 2),
+            &Device::Cpu,
+        )?
+        .save_safetensors("shard_0.weight", &path)?;
+
+        let raw = Arc::new(unsafe { MmapedSafetensors::new(&path)? });
+        let table = PleTable {
+            source: TableSource::Shards {
+                raw,
+                names: vec!["shard_0.weight".to_string()],
+                starts: vec![0],
+                dtype: DType::F32,
+            },
+            head_dim: 2,
+            #[cfg(feature = "cuda")]
+            device_index: None,
+            #[cfg(feature = "cuda")]
+            resident: None,
+        };
+
+        // Base rows are gathered unchanged with no overlay.
+        let gathered = table
+            .gather_host(&[0, 1], &EngramOverlay::new(2), &Device::Cpu)?
+            .to_vec2::<f32>()?;
+        assert_eq!(gathered, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+
+        // An overlay replaces only the overridden row.
+        let mut overlay = EngramOverlay::new(2);
+        overlay.set(1, vec![30.0, 40.0]).unwrap();
+        let gathered = table
+            .gather_host(&[0, 1], &overlay, &Device::Cpu)?
+            .to_vec2::<f32>()?;
+        assert_eq!(gathered, vec![vec![1.0, 2.0], vec![30.0, 40.0]]);
+
+        // Removing the override restores the base rows exactly.
+        overlay.remove(1);
+        let gathered = table
+            .gather_host(&[0, 1], &overlay, &Device::Cpu)?
+            .to_vec2::<f32>()?;
+        assert_eq!(gathered, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+        Ok(())
+    }
 }
