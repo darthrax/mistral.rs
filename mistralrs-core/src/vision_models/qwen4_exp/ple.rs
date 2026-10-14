@@ -1,12 +1,13 @@
 #![allow(clippy::cast_possible_truncation)]
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use mistralrs_quant::{
     safetensors::MmapedSafetensors, GgufArchive, QuantMethod, ReplicatedLayer, ShardedVarBuilder,
 };
+
+use crate::engram::{EngramOverlay, EngramOverlayHandle, register_overlay};
 
 use super::config::{PleConfig, TextConfig};
 use super::hyper::grouped_rms_norm;
@@ -561,7 +562,7 @@ impl PleTable {
 
     /// Host gather of `rows` into a `[rows.len(), head_dim]` tensor on `device`,
     /// applying `overlay` values to any overridden rows.
-    fn gather_host(&self, rows: &[u64], overlay: &PleOverlay, device: &Device) -> Result<Tensor> {
+    fn gather_host(&self, rows: &[u64], overlay: &EngramOverlay, device: &Device) -> Result<Tensor> {
         let outside = |row: u64| {
             candle_core::Error::msg(format!("PLE row {row} is outside the n-gram table"))
         };
@@ -754,57 +755,6 @@ pub(super) struct PleBatch<'a> {
     pub layout: Option<&'a crate::cuda::qwen4_exp::TokenLayout>,
 }
 
-/// Runtime edits to the hashed n-gram table: global row -> `head_dim` values.
-///
-/// Overrides are applied when rows are gathered on the host. A non-empty overlay
-/// forces the host gather path so a write can never be silently ignored.
-#[derive(Debug, Clone)]
-pub(super) struct PleOverlay {
-    head_dim: usize,
-    rows: BTreeMap<u64, Vec<f32>>,
-}
-
-#[allow(dead_code)] // some accessors are used by tests now and by the public API in phase 2
-impl PleOverlay {
-    pub(super) fn new(head_dim: usize) -> Self {
-        Self {
-            head_dim,
-            rows: BTreeMap::new(),
-        }
-    }
-
-    pub(super) fn head_dim(&self) -> usize {
-        self.head_dim
-    }
-
-    pub(super) fn set(&mut self, row: u64, values: Vec<f32>) -> Result<Option<Vec<f32>>> {
-        if values.len() != self.head_dim {
-            candle_core::bail!(
-                "PLE overlay row must have {} values, got {}",
-                self.head_dim,
-                values.len()
-            );
-        }
-        Ok(self.rows.insert(row, values))
-    }
-
-    pub(super) fn remove(&mut self, row: u64) -> Option<Vec<f32>> {
-        self.rows.remove(&row)
-    }
-
-    pub(super) fn get(&self, row: u64) -> Option<&[f32]> {
-        self.rows.get(&row).map(Vec::as_slice)
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.rows.len()
-    }
-}
-
 /// Copy one raw table row from the memory-mapped shards into `dst`.
 fn copy_shard_row(
     raw: &MmapedSafetensors,
@@ -852,7 +802,7 @@ fn decode_shard_row(src: &[u8], dtype: DType, out: &mut [f32]) -> Result<()> {
 pub(super) struct PleLayer {
     table: PleTable,
     /// Runtime row edits, shared so the public API can update them later.
-    overlay: Arc<RwLock<PleOverlay>>,
+    overlay: EngramOverlayHandle,
     hash: PleHash,
     #[cfg(feature = "cuda")]
     hash_ffi: crate::cuda::qwen4_exp::Q4PleHashParams,
@@ -894,7 +844,12 @@ impl PleLayer {
             #[cfg(feature = "cuda")]
             hash_ffi: hash.ffi()?,
             table,
-            overlay: Arc::new(RwLock::new(PleOverlay::new(ple.head_dim()))),
+            overlay: {
+                let overlay: EngramOverlayHandle =
+                    Arc::new(RwLock::new(EngramOverlay::new(ple.head_dim())));
+                register_overlay(overlay.clone());
+                overlay
+            },
             hash,
             key_proj: ReplicatedLayer::new(
                 ple.embed_dim,
@@ -1287,7 +1242,7 @@ mod tests {
 
     #[test]
     fn ple_overlay_sets_gets_and_removes_rows() {
-        let mut overlay = PleOverlay::new(3);
+        let mut overlay = EngramOverlay::new(3);
         assert!(overlay.is_empty());
         assert_eq!(overlay.set(7, vec![1.0, 2.0, 3.0]).unwrap(), None);
         assert_eq!(overlay.get(7), Some(&[1.0, 2.0, 3.0][..]));
@@ -1302,7 +1257,7 @@ mod tests {
 
     #[test]
     fn ple_overlay_rejects_a_row_of_the_wrong_width() {
-        let mut overlay = PleOverlay::new(3);
+        let mut overlay = EngramOverlay::new(3);
         assert!(overlay.set(1, vec![1.0, 2.0]).is_err());
     }
 }

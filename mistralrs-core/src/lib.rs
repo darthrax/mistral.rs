@@ -80,6 +80,7 @@ mod block_diffusion;
 mod diagnostics;
 mod diffusion_models;
 pub mod distributed;
+pub mod engram;
 pub mod files;
 mod gdn;
 mod gguf;

@@ -260,6 +260,10 @@ pub use mistralrs_core::{
     WIRE_EMBED_LIMIT_BYTES,
 };
 pub use mistralrs_core::{CalibrationAction, CalibrationStatus};
+pub use mistralrs_core::engram::{
+    EngramError, EngramOverlay, EngramOverlayHandle, clear_registered_overlays,
+    registered_overlays,
+};
 pub use mistralrs_core::{
     McpClient, McpClientConfig, McpServerConfig, McpServerSource, McpToolInfo,
 };
