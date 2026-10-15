@@ -1398,7 +1398,7 @@ mod tests {
         let tokens = Tensor::from_vec(vec![1u32, 2], 2, &Device::Cpu)?;
         let state_len = ple.conv_state_len();
         let context_len = ple.context_len();
-        let run = |layer: &PleLayer, overlay: &EngramOverlay| -> Result<Vec<f32>> {
+        let run = |layer: &PleLayer| -> Result<Vec<f32>> {
             let conv = Tensor::zeros((1, hc_hidden, state_len), DType::F32, &Device::Cpu)?;
             let history = Tensor::zeros((1, context_len), DType::F32, &Device::Cpu)?;
             let slots = Tensor::from_vec(vec![0u32], 1, &Device::Cpu)?;
@@ -1422,20 +1422,24 @@ mod tests {
             out.flatten_all()?.to_vec1::<f32>()
         };
 
-        let base = run(&layer, &EngramOverlay::new(head_dim))?;
+        let base = run(&layer)?;
 
         // Override a row that the hash actually addresses for these tokens.
         let mut rows = vec![0u64; hash.num_heads()];
         hash.rows(&[1u32, 2u32], 0, &[None, None], &mut rows);
         let target = rows[0];
 
-        let mut overlay = EngramOverlay::new(head_dim);
-        overlay.set(target, vec![9.0; head_dim]).unwrap();
-        let changed = run(&layer, &overlay)?;
+        layer
+            .overlay
+            .write()
+            .unwrap()
+            .set(target, vec![9.0; head_dim])
+            .unwrap();
+        let changed = run(&layer)?;
         assert_ne!(base, changed, "the overlay must change the PLE layer output");
 
-        overlay.remove(target);
-        let restored = run(&layer, &overlay)?;
+        layer.overlay.write().unwrap().remove(target);
+        let restored = run(&layer)?;
         assert_eq!(base, restored, "removing the overlay must restore the output");
         Ok(())
     }
