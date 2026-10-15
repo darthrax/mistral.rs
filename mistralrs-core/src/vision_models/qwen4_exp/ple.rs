@@ -1309,4 +1309,134 @@ mod tests {
         assert_eq!(gathered, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
         Ok(())
     }
+
+    #[test]
+    fn engram_overlay_changes_ple_layer_output() -> Result<()> {
+        use std::collections::HashMap;
+
+        // A tiny PLE layer: small dims keep the hashed row indices few.
+        let mut cfg = flash_next_text_config(1);
+        cfg.hidden_size = 8;
+        cfg.hc_count = 2;
+        cfg.hc_lowrank = 2;
+        cfg.vocab_size = 64;
+        cfg.ngram_vocab_size_base = 32;
+        cfg.ngram_size = 3;
+        cfg.heads_per_ngram = 2;
+        cfg.ple_embed_dim = Some(16);
+        cfg.ple_conv_kernel_size = 2;
+        cfg.ple_layer_ids = vec![1];
+
+        let ple = cfg.ple()?.unwrap();
+        let hash = PleHash::new(&cfg, &ple, 0);
+        let head_dim = ple.head_dim();
+        let embed_dim = hash.num_heads() * head_dim;
+        let hc_hidden = cfg.hc_hidden_size();
+        let hidden = cfg.hidden_size;
+        let kernel = ple.conv_kernel_size;
+        let total_rows: u64 = hash.offsets.last().copied().unwrap_or(0)
+            + hash.vocab_sizes.last().copied().unwrap_or(0);
+
+        // Deterministic, non-zero weights so an overlay edit changes the output.
+        let ramp = move |len: usize| -> Vec<f32> {
+            (0..len).map(|i| (i as f32 + 1.0) * 0.01).collect()
+        };
+        let f32_tensor = |shape: (usize, usize), len: usize| -> Result<Tensor> {
+            Tensor::from_vec(ramp(len), shape, &Device::Cpu)
+        };
+
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+        tensors.insert(
+            "ple_embedding.ngram_embedding.shard_0.weight".to_string(),
+            Tensor::from_vec(
+                ramp(total_rows as usize * head_dim),
+                (total_rows as usize, head_dim),
+                &Device::Cpu,
+            )?
+            .to_dtype(DType::BF16)?,
+        );
+        tensors.insert(
+            "key_proj.weight".to_string(),
+            f32_tensor((hc_hidden, embed_dim), hc_hidden * embed_dim)?,
+        );
+        tensors.insert(
+            "value_proj.weight".to_string(),
+            f32_tensor((hidden, embed_dim), hidden * embed_dim)?,
+        );
+        tensors.insert(
+            "norm_key.weight".to_string(),
+            Tensor::from_vec(ramp(hc_hidden), hc_hidden, &Device::Cpu)?,
+        );
+        tensors.insert(
+            "norm_query.weight".to_string(),
+            Tensor::from_vec(ramp(hc_hidden), hc_hidden, &Device::Cpu)?,
+        );
+        tensors.insert(
+            "norm_conv.weight".to_string(),
+            Tensor::from_vec(ramp(hc_hidden), hc_hidden, &Device::Cpu)?,
+        );
+        tensors.insert(
+            "conv1d.weight".to_string(),
+            Tensor::from_vec(ramp(hc_hidden * kernel), (hc_hidden, 1, kernel), &Device::Cpu)?,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.safetensors");
+        candle_core::safetensors::save(&tensors, &path)?;
+
+        let vb = unsafe {
+            mistralrs_quant::ShardedSafeTensors::sharded(
+                &[path],
+                DType::F32,
+                &Device::Cpu,
+                None,
+                std::sync::Arc::new(|_: String| true),
+            )?
+        };
+        let layer = PleLayer::load(&cfg, &ple, vb)?;
+
+        let tokens = Tensor::from_vec(vec![1u32, 2], 2, &Device::Cpu)?;
+        let state_len = ple.conv_state_len();
+        let context_len = ple.context_len();
+        let run = |layer: &PleLayer, overlay: &EngramOverlay| -> Result<Vec<f32>> {
+            let conv = Tensor::zeros((1, hc_hidden, state_len), DType::F32, &Device::Cpu)?;
+            let history = Tensor::zeros((1, context_len), DType::F32, &Device::Cpu)?;
+            let slots = Tensor::from_vec(vec![0u32], 1, &Device::Cpu)?;
+            let state = PleState {
+                conv: &conv,
+                history: &history,
+                slots: &slots,
+            };
+            let seqs = [(0usize, 2usize)];
+            let batch = PleBatch {
+                seqs: &seqs,
+                #[cfg(feature = "cuda")]
+                layout: None,
+            };
+            let hidden_states = Tensor::from_vec(
+                ramp(2 * hc_hidden),
+                (2, hc_hidden),
+                &Device::Cpu,
+            )?;
+            let out = layer.forward(&hidden_states, &tokens, &state, &batch, None)?;
+            out.flatten_all()?.to_vec1::<f32>()
+        };
+
+        let base = run(&layer, &EngramOverlay::new(head_dim))?;
+
+        // Override a row that the hash actually addresses for these tokens.
+        let mut rows = vec![0u64; hash.num_heads()];
+        hash.rows(&[1u32, 2u32], 0, &[None, None], &mut rows);
+        let target = rows[0];
+
+        let mut overlay = EngramOverlay::new(head_dim);
+        overlay.set(target, vec![9.0; head_dim]).unwrap();
+        let changed = run(&layer, &overlay)?;
+        assert_ne!(base, changed, "the overlay must change the PLE layer output");
+
+        overlay.remove(target);
+        let restored = run(&layer, &overlay)?;
+        assert_eq!(base, restored, "removing the overlay must restore the output");
+        Ok(())
+    }
 }
